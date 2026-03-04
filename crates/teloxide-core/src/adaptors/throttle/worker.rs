@@ -184,7 +184,7 @@ pub(super) async fn worker<B>(
 
         // 中文注释：优先处理 freeze（RetryAfter/慢速模式更新）；freeze 可能会 sleep。
         if let Ok(freeze_until) = freeze_rx.try_recv() {
-            freeze(&mut freeze_rx, slow_mode.as_mut(), &bot, Some(freeze_until), Some(ctx)).await;
+            freeze(&mut freeze_rx, slow_mode.as_mut(), &bot, Some(freeze_until), ctx).await;
         }
 
         // 尝试从 rx 把队列填充到 capacity（防 DOS：不超过 capacity）。
@@ -201,7 +201,7 @@ pub(super) async fn worker<B>(
                 }
                 // 处理 freeze/info，避免“队列空时阻塞导致无法 set_limits”。
                 Some(freeze_until) = freeze_rx.recv() => {
-                    freeze(&mut freeze_rx, slow_mode.as_mut(), &bot, Some(freeze_until), Some(ctx)).await;
+                    freeze(&mut freeze_rx, slow_mode.as_mut(), &bot, Some(freeze_until), ctx).await;
                     continue;
                 }
                 Some(info) = info_rx.recv() => {
@@ -302,7 +302,7 @@ pub(super) async fn worker<B>(
                 tokio::select! {
                     _ = &mut sleep => {}
                     Some(freeze_until) = freeze_rx.recv() => {
-                        freeze(&mut freeze_rx, slow_mode.as_mut(), &bot, Some(freeze_until), Some(ctx)).await;
+                        freeze(&mut freeze_rx, slow_mode.as_mut(), &bot, Some(freeze_until), ctx).await;
                     }
                     Some(info) = info_rx.recv() => {
                         handle_info_message(info, &mut limits);
@@ -417,6 +417,11 @@ pub(super) async fn worker<B>(
             }
         }
 
+        // 中文注释：
+        // - queue_removing 持有对 queue 的可变借用（vecrem::Removing）；
+        // - 下面需要读取/写入 queue（例如 queue.is_empty / queue.push），因此必须提前 drop。
+        drop(queue_removing);
+
         // 队列还有积压：计算下一次唤醒时间（最早可放行的那个）。
         if !queue.is_empty() {
             // 全局每秒触顶时，优先等待全局窗口释放。
@@ -436,7 +441,7 @@ pub(super) async fn worker<B>(
                     tokio::select! {
                         _ = &mut sleep => {}
                     Some(freeze_until) = freeze_rx.recv() => {
-                        freeze(&mut freeze_rx, slow_mode.as_mut(), &bot, Some(freeze_until), Some(ctx)).await;
+                        freeze(&mut freeze_rx, slow_mode.as_mut(), &bot, Some(freeze_until), ctx).await;
                     }
                         Some(info) = info_rx.recv() => {
                             handle_info_message(info, &mut limits);
@@ -467,7 +472,7 @@ async fn freeze(
     mut slow_mode: Option<&mut HashMap<ChatIdHash, (Duration, Instant)>>,
     bot: &impl Requester,
     mut imm: Option<FreezeUntil>,
-    context: Option<&str>,
+    ctx: &str,
 ) {
     while let Some(freeze_until) = imm.take().or_else(|| rx.try_recv().ok()) {
         let FreezeUntil { until, after, chat } = freeze_until;
@@ -507,23 +512,13 @@ async fn freeze(
         // Do not sleep if slow mode is enabled since the freeze is most likely caused
         // by the said slow mode and not by the global limits.
         if !slow_mode_enabled_and_likely_the_cause {
-            if let Some(ctx) = context {
-                log::warn!(
-                    "freezing the bot for approximately {after:?} due to `RetryAfter` error from telegram (ctx={ctx})"
-                );
-            } else {
-                log::warn!(
-                    "freezing the bot for approximately {after:?} due to `RetryAfter` error from telegram"
-                );
-            }
+            log::warn!(
+                "freezing the bot for approximately {after:?} due to `RetryAfter` error from telegram (ctx={ctx})"
+            );
 
             tokio::time::sleep_until(until.into()).await;
 
-            if let Some(ctx) = context {
-                log::warn!("unfreezing the bot (ctx={ctx})");
-            } else {
-                log::warn!("unfreezing the bot");
-            }
+            log::warn!("unfreezing the bot (ctx={ctx})");
         }
     }
 }
@@ -535,11 +530,8 @@ async fn read_from_rx<T>(
     context: Option<&str>,
 ) {
     if queue.is_empty() {
-        if let Some(ctx) = context {
-            log::debug!("blocking on queue (ctx={ctx})");
-        } else {
-            log::debug!("blocking on queue");
-        }
+        let ctx = context.unwrap_or("-");
+        log::debug!("blocking on queue (ctx={ctx})");
 
         match rx.recv().await {
             Some(req) => queue.push(req),

@@ -166,6 +166,8 @@ where
     R::Err: AsResponseParameters + Send,
     Output<R>: Send,
 {
+    let ctx = context.as_deref().unwrap_or("-");
+
     // We use option in `ShareableRequest` to `take` when sending by value.
     //
     // All unwraps down below will succeed because we always return immediately
@@ -178,11 +180,7 @@ where
         // but just in case it has dropped the queue, we want to just send the
         // request.
         if worker.send((chat, lock)).await.is_err() {
-            if let Some(ctx) = context.as_deref() {
-                log::error!("Worker dropped the queue before sending all requests (ctx={ctx})");
-            } else {
-                log::error!("Worker dropped the queue before sending all requests");
-            }
+            log::error!("Worker dropped the queue before sending all requests (ctx={ctx})");
 
             let res = match &mut request {
                 ShareableRequest::Shared(shared) => shared.send_ref().await,
@@ -218,11 +216,7 @@ where
             let _ = freeze.send(FreezeUntil { until, after, chat }).await;
 
             if retry {
-                if let Some(ctx) = context.as_deref() {
-                    log::warn!("Freezing, before retrying: {retry_after:?} (ctx={ctx})");
-                } else {
-                    log::warn!("Freezing, before retrying: {retry_after:?}");
-                }
+                log::warn!("Freezing, before retrying: {retry_after:?} (ctx={ctx})");
                 tokio::time::sleep_until(until.into()).await;
             }
         }
