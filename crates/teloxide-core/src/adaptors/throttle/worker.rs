@@ -144,10 +144,34 @@ pub(super) async fn worker<B>(
 
     let (freeze_tx, mut freeze_rx) = mpsc::channel::<FreezeUntil>(1);
 
+    // 中文注释：
+    // - 事件驱动模型下，如果长时间没有任何新请求入队，worker 会阻塞在 rx.recv()；
+    // - 但滑动窗口数据结构（per_chat_sec/per_chat_min）需要定期清理，否则会在“曾经发过一次就永久占 map”
+    //   的情况下造成内存增长；
+    // - 因此这里设置一个低频的清理定时器（默认 60s 一次），只在 idle 时用 timer 唤醒。
+    let mut next_cleanup_at = Instant::now().checked_add(MINUTE).unwrap_or_else(Instant::now);
+
     while !rx_is_closed || !queue.is_empty() {
         // 中文注释：尽量及时响应 GetLimits / SetLimits。
         while let Ok(req) = info_rx.try_recv() {
             handle_info_message(req, &mut limits);
+        }
+
+        // 中文注释：定期清理滑动窗口 map，避免长期运行时内存增长。
+        let now_for_cleanup = Instant::now();
+        if now_for_cleanup >= next_cleanup_at {
+            let sec_back = now_for_cleanup.checked_sub(SECOND).unwrap_or(now_for_cleanup);
+            let min_back = now_for_cleanup.checked_sub(MINUTE).unwrap_or(now_for_cleanup);
+            trim_deque(&mut global_sec, sec_back);
+            per_chat_sec.retain(|_, deq| {
+                trim_deque(deq, sec_back);
+                !deq.is_empty()
+            });
+            per_chat_min.retain(|_, deq| {
+                trim_deque(deq, min_back);
+                !deq.is_empty()
+            });
+            next_cleanup_at = now_for_cleanup.checked_add(MINUTE).unwrap_or(now_for_cleanup);
         }
 
         // 中文注释：优先处理 freeze（RetryAfter/慢速模式更新）；freeze 可能会 sleep。
@@ -157,6 +181,8 @@ pub(super) async fn worker<B>(
 
         // 尝试从 rx 把队列填充到 capacity（防 DOS：不超过 capacity）。
         if queue.is_empty() && !rx_is_closed {
+            let cleanup_sleep = tokio::time::sleep_until(next_cleanup_at.into());
+            tokio::pin!(cleanup_sleep);
             tokio::select! {
                 // 有新请求时立即入队。
                 req = rx.recv() => {
@@ -172,6 +198,23 @@ pub(super) async fn worker<B>(
                 }
                 Some(info) = info_rx.recv() => {
                     handle_info_message(info, &mut limits);
+                    continue;
+                }
+                // idle 时依然要定期清理滑动窗口 map，避免内存增长。
+                _ = &mut cleanup_sleep => {
+                    let now_for_cleanup = Instant::now();
+                    let sec_back = now_for_cleanup.checked_sub(SECOND).unwrap_or(now_for_cleanup);
+                    let min_back = now_for_cleanup.checked_sub(MINUTE).unwrap_or(now_for_cleanup);
+                    trim_deque(&mut global_sec, sec_back);
+                    per_chat_sec.retain(|_, deq| {
+                        trim_deque(deq, sec_back);
+                        !deq.is_empty()
+                    });
+                    per_chat_min.retain(|_, deq| {
+                        trim_deque(deq, min_back);
+                        !deq.is_empty()
+                    });
+                    next_cleanup_at = now_for_cleanup.checked_add(MINUTE).unwrap_or(now_for_cleanup);
                     continue;
                 }
             }
