@@ -24,6 +24,8 @@ pub struct ThrottlingRequest<R: HasPayload> {
     pub(super) request: Arc<R>,
     pub(super) chat_id: fn(&R::Payload) -> ChatIdHash,
     pub(super) worker: mpsc::Sender<(ChatIdHash, RequestLock)>,
+    /// 中文注释：用于 throttle 内部日志输出的上下文标签（例如 tg_bot_id / bot_username）。
+    pub(super) context: Option<Arc<str>>,
 }
 
 /// Future returned by [`ThrottlingRequest`]s.
@@ -66,7 +68,7 @@ where
             Ok(owned) => ShareableRequest::Owned(Some(owned)),
             Err(shared) => ShareableRequest::Shared(shared),
         };
-        let fut = send(request, chat, self.worker);
+        let fut = send(request, chat, self.worker, self.context);
 
         ThrottlingSend(Box::pin(fut))
     }
@@ -74,7 +76,7 @@ where
     fn send_ref(&self) -> Self::SendRef {
         let chat = (self.chat_id)(self.payload_ref());
         let request = ShareableRequest::Shared(Arc::clone(&self.request));
-        let fut = send(request, chat, self.worker.clone());
+        let fut = send(request, chat, self.worker.clone(), self.context.clone());
 
         ThrottlingSend(Box::pin(fut))
     }
@@ -157,6 +159,7 @@ async fn send<R>(
     mut request: ShareableRequest<R>,
     chat: ChatIdHash,
     worker: mpsc::Sender<(ChatIdHash, RequestLock)>,
+    context: Option<Arc<str>>,
 ) -> Result<Output<R>, R::Err>
 where
     R: Request + Send + Sync + 'static,
@@ -175,7 +178,11 @@ where
         // but just in case it has dropped the queue, we want to just send the
         // request.
         if worker.send((chat, lock)).await.is_err() {
-            log::error!("Worker dropped the queue before sending all requests");
+            if let Some(ctx) = context.as_deref() {
+                log::error!("Worker dropped the queue before sending all requests (ctx={ctx})");
+            } else {
+                log::error!("Worker dropped the queue before sending all requests");
+            }
 
             let res = match &mut request {
                 ShareableRequest::Shared(shared) => shared.send_ref().await,
@@ -211,7 +218,11 @@ where
             let _ = freeze.send(FreezeUntil { until, after, chat }).await;
 
             if retry {
-                log::warn!("Freezing, before retrying: {retry_after:?}");
+                if let Some(ctx) = context.as_deref() {
+                    log::warn!("Freezing, before retrying: {retry_after:?} (ctx={ctx})");
+                } else {
+                    log::warn!("Freezing, before retrying: {retry_after:?}");
+                }
                 tokio::time::sleep_until(until.into()).await;
             }
         }

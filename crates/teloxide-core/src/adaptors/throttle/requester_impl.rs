@@ -15,6 +15,7 @@ macro_rules! f {
             request: Arc::new($this.inner().$m($($arg),*)),
             chat_id: |p| (&p.payload_ref().chat_id).into(),
             worker: $this.queue.clone(),
+            context: $this.context.clone(),
         }
     };
 }

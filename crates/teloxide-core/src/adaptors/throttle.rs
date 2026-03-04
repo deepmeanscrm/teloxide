@@ -12,6 +12,7 @@ mod worker;
 use std::{
     future::Future,
     hash::{Hash, Hasher},
+    sync::Arc,
 };
 
 use tokio::sync::{
@@ -76,6 +77,8 @@ pub struct Throttle<B> {
     // `RequestLock` allows to unlock requests (allowing them to be sent).
     queue: mpsc::Sender<(ChatIdHash, RequestLock)>,
     info_tx: mpsc::Sender<InfoMessage>,
+    /// 中文注释：用于 throttle 内部日志的上下文标签（由上层注入）。
+    context: Option<Arc<str>>,
 }
 
 impl<B> Throttle<B> {
@@ -104,8 +107,14 @@ impl<B> Throttle<B> {
         let (tx, rx) = mpsc::channel(settings.limits.messages_per_sec_overall as usize);
         let (info_tx, info_rx) = mpsc::channel(2);
 
+        let context = settings.context.clone();
         let worker = worker(settings, rx, info_rx, bot.clone());
-        let this = Self { bot, queue: tx, info_tx };
+        let this = Self {
+            bot,
+            queue: tx,
+            info_tx,
+            context,
+        };
 
         (this, worker)
     }

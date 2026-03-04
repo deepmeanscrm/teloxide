@@ -1,4 +1,4 @@
-use std::pin::Pin;
+use std::{pin::Pin, sync::Arc};
 
 use futures::{future::ready, Future};
 
@@ -28,6 +28,12 @@ pub struct Settings {
     pub on_queue_full: BoxedFnMut<usize, BoxedFuture>,
     pub retry: bool,
     pub check_slow_mode: bool,
+    /// 中文注释：用于在 throttle 内部日志中标识“是哪个 bot 打出来的”。
+    ///
+    /// - 由于 teloxide-core 无法从 token 推导 bot 信息（也不应持有 token），
+    ///   因此由上层在创建 Throttle 时注入一个上下文标签（例如 tg_bot_id /
+    ///   bot_username）。
+    pub context: Option<Arc<str>>,
 }
 
 /// Telegram request limits.
@@ -78,18 +84,27 @@ impl Settings {
         self.check_slow_mode = true;
         self
     }
+
+    /// 设置 throttle 日志上下文（例如：`tg_bot_id=123456 @mybot`）。
+    pub fn context(mut self, val: impl Into<Arc<str>>) -> Self {
+        self.context = Some(val.into());
+        self
+    }
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
             limits: <_>::default(),
-            on_queue_full: Box::new(|pending| {
-                log::warn!("Throttle queue is full ({pending} pending requests)");
+            on_queue_full: Box::new(|_pending| {
+                // 中文注释：
+                // - queue full 的日志由 worker 统一输出（带 context），这里保持默认 no-op；
+                // - 若业务希望在 queue full 时做额外动作，可以显式设置 `on_queue_full(...)`。
                 Box::pin(ready(()))
             }),
             retry: true,
             check_slow_mode: false,
+            context: None,
         }
     }
 }

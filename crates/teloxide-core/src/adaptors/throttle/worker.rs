@@ -112,7 +112,13 @@ fn handle_info_message(req: InfoMessage, limits: &mut Limits) {
 // the request that it can be now executed, increase counts, add record to the
 // history.
 pub(super) async fn worker<B>(
-    Settings { mut limits, mut on_queue_full, retry, check_slow_mode }: Settings,
+    Settings {
+        mut limits,
+        mut on_queue_full,
+        retry,
+        check_slow_mode,
+        context,
+    }: Settings,
     mut rx: mpsc::Receiver<(ChatIdHash, RequestLock)>,
     mut info_rx: mpsc::Receiver<InfoMessage>,
     bot: B,
@@ -120,6 +126,8 @@ pub(super) async fn worker<B>(
     B: Requester,
     B::Err: AsResponseParameters,
 {
+    let ctx = context.as_deref().unwrap_or("-");
+
     // FIXME(waffle): Make an research about data structures for this queue.
     //                Currently this is O(n) removing (n = number of elements
     //                stayed), amortized O(1) push (vec+vecrem).
@@ -176,7 +184,7 @@ pub(super) async fn worker<B>(
 
         // 中文注释：优先处理 freeze（RetryAfter/慢速模式更新）；freeze 可能会 sleep。
         if let Ok(freeze_until) = freeze_rx.try_recv() {
-            freeze(&mut freeze_rx, slow_mode.as_mut(), &bot, Some(freeze_until)).await;
+            freeze(&mut freeze_rx, slow_mode.as_mut(), &bot, Some(freeze_until), Some(ctx)).await;
         }
 
         // 尝试从 rx 把队列填充到 capacity（防 DOS：不超过 capacity）。
@@ -193,7 +201,7 @@ pub(super) async fn worker<B>(
                 }
                 // 处理 freeze/info，避免“队列空时阻塞导致无法 set_limits”。
                 Some(freeze_until) = freeze_rx.recv() => {
-                    freeze(&mut freeze_rx, slow_mode.as_mut(), &bot, Some(freeze_until)).await;
+                    freeze(&mut freeze_rx, slow_mode.as_mut(), &bot, Some(freeze_until), Some(ctx)).await;
                     continue;
                 }
                 Some(info) = info_rx.recv() => {
@@ -233,6 +241,11 @@ pub(super) async fn worker<B>(
 
         if queue.len() == queue.capacity() && last_queue_full.elapsed() > QUEUE_FULL_DELAY {
             last_queue_full = Instant::now();
+            log::warn!(
+                "Throttle queue is full (pending={} pending requests, ctx={})",
+                queue.len(),
+                ctx
+            );
             tokio::spawn(on_queue_full(queue.len()));
         }
 
@@ -289,7 +302,7 @@ pub(super) async fn worker<B>(
                 tokio::select! {
                     _ = &mut sleep => {}
                     Some(freeze_until) = freeze_rx.recv() => {
-                        freeze(&mut freeze_rx, slow_mode.as_mut(), &bot, Some(freeze_until)).await;
+                        freeze(&mut freeze_rx, slow_mode.as_mut(), &bot, Some(freeze_until), Some(ctx)).await;
                     }
                     Some(info) = info_rx.recv() => {
                         handle_info_message(info, &mut limits);
@@ -422,9 +435,9 @@ pub(super) async fn worker<B>(
                     tokio::pin!(sleep);
                     tokio::select! {
                         _ = &mut sleep => {}
-                        Some(freeze_until) = freeze_rx.recv() => {
-                            freeze(&mut freeze_rx, slow_mode.as_mut(), &bot, Some(freeze_until)).await;
-                        }
+                    Some(freeze_until) = freeze_rx.recv() => {
+                        freeze(&mut freeze_rx, slow_mode.as_mut(), &bot, Some(freeze_until), Some(ctx)).await;
+                    }
                         Some(info) = info_rx.recv() => {
                             handle_info_message(info, &mut limits);
                         }
@@ -454,6 +467,7 @@ async fn freeze(
     mut slow_mode: Option<&mut HashMap<ChatIdHash, (Duration, Instant)>>,
     bot: &impl Requester,
     mut imm: Option<FreezeUntil>,
+    context: Option<&str>,
 ) {
     while let Some(freeze_until) = imm.take().or_else(|| rx.try_recv().ok()) {
         let FreezeUntil { until, after, chat } = freeze_until;
@@ -493,21 +507,39 @@ async fn freeze(
         // Do not sleep if slow mode is enabled since the freeze is most likely caused
         // by the said slow mode and not by the global limits.
         if !slow_mode_enabled_and_likely_the_cause {
-            log::warn!(
-                "freezing the bot for approximately {after:?} due to `RetryAfter` error from \
-                 telegram"
-            );
+            if let Some(ctx) = context {
+                log::warn!(
+                    "freezing the bot for approximately {after:?} due to `RetryAfter` error from telegram (ctx={ctx})"
+                );
+            } else {
+                log::warn!(
+                    "freezing the bot for approximately {after:?} due to `RetryAfter` error from telegram"
+                );
+            }
 
             tokio::time::sleep_until(until.into()).await;
 
-            log::warn!("unfreezing the bot");
+            if let Some(ctx) = context {
+                log::warn!("unfreezing the bot (ctx={ctx})");
+            } else {
+                log::warn!("unfreezing the bot");
+            }
         }
     }
 }
 
-async fn read_from_rx<T>(rx: &mut mpsc::Receiver<T>, queue: &mut Vec<T>, rx_is_closed: &mut bool) {
+async fn read_from_rx<T>(
+    rx: &mut mpsc::Receiver<T>,
+    queue: &mut Vec<T>,
+    rx_is_closed: &mut bool,
+    context: Option<&str>,
+) {
     if queue.is_empty() {
-        log::debug!("blocking on queue");
+        if let Some(ctx) = context {
+            log::debug!("blocking on queue (ctx={ctx})");
+        } else {
+            log::debug!("blocking on queue");
+        }
 
         match rx.recv().await {
             Some(req) => queue.push(req),
@@ -539,6 +571,6 @@ mod tests {
         drop(tx);
 
         // Previously this caused an infinite loop
-        super::read_from_rx::<()>(&mut rx, &mut Vec::new(), &mut false).await;
+        super::read_from_rx::<()>(&mut rx, &mut Vec::new(), &mut false, None).await;
     }
 }
