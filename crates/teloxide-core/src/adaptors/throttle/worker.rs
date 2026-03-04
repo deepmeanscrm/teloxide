@@ -1,11 +1,8 @@
 use std::{
-    collections::{hash_map::Entry, HashMap, VecDeque},
-    pin::pin,
+    collections::{HashMap, VecDeque},
     time::{Duration, Instant},
 };
 
-use either::Either;
-use futures::{future, FutureExt as _};
 use tokio::sync::{mpsc, mpsc::error::TryRecvError, oneshot::Sender};
 use vecrem::VecExt;
 
@@ -17,12 +14,6 @@ use crate::{
 
 const MINUTE: Duration = Duration::from_secs(60);
 const SECOND: Duration = Duration::from_secs(1);
-
-// Delay between worker iterations.
-//
-// For now it's `second/4`, but that number is chosen pretty randomly, we may
-// want to change this.
-const DELAY: Duration = Duration::from_millis(250);
 
 /// Minimal time between calls to queue_full function
 const QUEUE_FULL_DELAY: Duration = Duration::from_secs(4);
@@ -48,6 +39,34 @@ pub(super) struct FreezeUntil {
     pub(super) until: Instant,
     pub(super) after: Duration,
     pub(super) chat: ChatIdHash,
+}
+
+fn trim_deque(deque: &mut VecDeque<Instant>, cutoff: Instant) {
+    while let Some(t) = deque.front().copied() {
+        if t >= cutoff {
+            break;
+        }
+        deque.pop_front();
+    }
+}
+
+fn min_instant_opt(cur: Option<Instant>, next: Instant) -> Option<Instant> {
+    match cur {
+        Some(c) => Some(std::cmp::min(c, next)),
+        None => Some(next),
+    }
+}
+
+fn handle_info_message(req: InfoMessage, limits: &mut Limits) {
+    // Errors are ignored with .ok(). Error means that the response channel
+    // is closed and the response isn't needed.
+    match req {
+        InfoMessage::GetLimits { response } => response.send(*limits).ok(),
+        InfoMessage::SetLimits { new, response } => {
+            *limits = new;
+            response.send(()).ok()
+        }
+    };
 }
 
 // Throttling is quite complicated. This comment describes the algorithm of the
@@ -107,8 +126,13 @@ pub(super) async fn worker<B>(
     let mut queue: Vec<(ChatIdHash, RequestLock)> =
         Vec::with_capacity(limits.messages_per_sec_overall as usize);
 
-    let mut history: VecDeque<(ChatIdHash, Instant)> = VecDeque::new();
-    let mut requests_sent = RequestsSentToChats::default();
+    // 中文注释：
+    // - 严格滑动窗口（方案 A）：用 deque 记录“最近窗口内”的发送时间；
+    // - 事件驱动：不再固定 tick（例如 250ms）轮询，而是“能发就立刻放行；不能发就 sleep_until(next_allowed_at)”；
+    // - 这样在额度充足时可以瞬发，减少固定轮询带来的额外延迟抖动。
+    let mut global_sec: VecDeque<Instant> = VecDeque::new();
+    let mut per_chat_sec: HashMap<ChatIdHash, VecDeque<Instant>> = HashMap::new();
+    let mut per_chat_min: HashMap<ChatIdHash, VecDeque<Instant>> = HashMap::new();
 
     let mut slow_mode: Option<HashMap<ChatIdHash, (Duration, Instant)>> =
         check_slow_mode.then(HashMap::new);
@@ -121,33 +145,48 @@ pub(super) async fn worker<B>(
     let (freeze_tx, mut freeze_rx) = mpsc::channel::<FreezeUntil>(1);
 
     while !rx_is_closed || !queue.is_empty() {
-        // FIXME(waffle):
-        // 1. If the `queue` is empty, `read_from_rx` call down below will 'block'
-        //    execution until a request is sent. While the execution is 'blocked' no
-        //    `InfoMessage`s could be answered.
-        //
-        // 2. If limits are decreased, ideally we want to shrink queue.
-        //
-        // *blocked in asynchronous way
-        answer_info(&mut info_rx, &mut limits);
+        // 中文注释：尽量及时响应 GetLimits / SetLimits。
+        while let Ok(req) = info_rx.try_recv() {
+            handle_info_message(req, &mut limits);
+        }
 
-        loop {
-            let res = future::select(
-                pin!(freeze_rx.recv()),
-                pin!(read_from_rx(&mut rx, &mut queue, &mut rx_is_closed)),
-            )
-            .map(either)
-            .await
-            .map_either(|l| l.0, |r| r.0);
+        // 中文注释：优先处理 freeze（RetryAfter/慢速模式更新）；freeze 可能会 sleep。
+        if let Ok(freeze_until) = freeze_rx.try_recv() {
+            freeze(&mut freeze_rx, slow_mode.as_mut(), &bot, Some(freeze_until)).await;
+        }
 
-            match res {
-                Either::Left(freeze_until) => {
-                    freeze(&mut freeze_rx, slow_mode.as_mut(), &bot, freeze_until).await;
+        // 尝试从 rx 把队列填充到 capacity（防 DOS：不超过 capacity）。
+        if queue.is_empty() && !rx_is_closed {
+            tokio::select! {
+                // 有新请求时立即入队。
+                req = rx.recv() => {
+                    match req {
+                        Some(r) => queue.push(r),
+                        None => rx_is_closed = true,
+                    }
                 }
-                Either::Right(()) => break,
+                // 处理 freeze/info，避免“队列空时阻塞导致无法 set_limits”。
+                Some(freeze_until) = freeze_rx.recv() => {
+                    freeze(&mut freeze_rx, slow_mode.as_mut(), &bot, Some(freeze_until)).await;
+                    continue;
+                }
+                Some(info) = info_rx.recv() => {
+                    handle_info_message(info, &mut limits);
+                    continue;
+                }
             }
         }
-        //debug_assert_eq!(queue.capacity(), limits.messages_per_sec_overall as usize);
+
+        while queue.len() < queue.capacity() {
+            match rx.try_recv() {
+                Ok(req) => queue.push(req),
+                Err(TryRecvError::Disconnected) => {
+                    rx_is_closed = true;
+                    break;
+                }
+                Err(TryRecvError::Empty) => break,
+            }
+        }
 
         if queue.len() == queue.capacity() && last_queue_full.elapsed() > QUEUE_FULL_DELAY {
             last_queue_full = Instant::now();
@@ -191,109 +230,177 @@ pub(super) async fn worker<B>(
         let min_back = now.checked_sub(MINUTE).unwrap_or(now);
         let sec_back = now.checked_sub(SECOND).unwrap_or(now);
 
-        // make history and requests_sent up-to-date
-        while let Some((_, time)) = history.front() {
-            // history is sorted, we found first up-to-date thing
-            if time >= &min_back {
-                break;
-            }
+        // 更新全局每秒滑动窗口。
+        trim_deque(&mut global_sec, sec_back);
 
-            if let Some((chat, _)) = history.pop_front() {
-                let entry = requests_sent.per_min.entry(chat).and_modify(|count| {
-                    *count -= 1;
-                });
-
-                if let Entry::Occupied(entry) = entry {
-                    if *entry.get() == 0 {
-                        entry.remove_entry();
+        // 全局每秒触顶：事件驱动 sleep_until 最早可发送时刻。
+        if global_sec.len() as u32 >= limits.messages_per_sec_overall {
+            let next_at = global_sec
+                .front()
+                .copied()
+                .and_then(|t| t.checked_add(SECOND))
+                .unwrap_or(now);
+            if next_at > now {
+                let sleep = tokio::time::sleep_until(next_at.into());
+                tokio::pin!(sleep);
+                tokio::select! {
+                    _ = &mut sleep => {}
+                    Some(freeze_until) = freeze_rx.recv() => {
+                        freeze(&mut freeze_rx, slow_mode.as_mut(), &bot, Some(freeze_until)).await;
+                    }
+                    Some(info) = info_rx.recv() => {
+                        handle_info_message(info, &mut limits);
+                    }
+                    req = rx.recv(), if queue.len() < queue.capacity() && !rx_is_closed => {
+                        match req {
+                            Some(r) => queue.push(r),
+                            None => rx_is_closed = true,
+                        }
                     }
                 }
             }
-        }
-
-        // as truncates which is ok since in case of truncation it would always be >=
-        // limits.overall_s
-        let used = history.iter().rev().take_while(|(_, time)| time > &sec_back).count() as u32;
-        let mut allowed = limits.messages_per_sec_overall.saturating_sub(used);
-
-        if allowed == 0 {
-            requests_sent.per_sec.clear();
-            tokio::time::sleep(DELAY).await;
             continue;
         }
 
-        for (chat, _) in history.iter().rev().take_while(|(_, time)| time > &sec_back) {
-            *requests_sent.per_sec.entry(*chat).or_insert(0) += 1;
-        }
-
         let mut queue_removing = queue.removing();
+        let mut next_wake_at: Option<Instant> = None;
+        let mut allowed_global = limits
+            .messages_per_sec_overall
+            .saturating_sub(global_sec.len() as u32);
 
-        while let Some(entry) = queue_removing.next() {
+        while allowed_global > 0 {
+            let Some(entry) = queue_removing.next() else {
+                break;
+            };
             let chat = &entry.value().0;
 
-            let slow_mode = slow_mode.as_mut().and_then(|sm| sm.get_mut(chat));
+            // 计算该 chat 下一次可放行的时间点（严格滑动窗口 + 慢速模式）。
+            let mut chat_allowed_at = now;
 
-            if let Some(&mut (delay, last)) = slow_mode {
-                if last + delay > Instant::now() {
-                    continue;
+            // 慢速模式：last + delay 之前不能发。
+            if let Some(sm) = slow_mode
+                .as_ref()
+                .and_then(|m| m.get(chat).map(|(delay, last)| (delay, last)))
+            {
+                let ready_at = sm.1.checked_add(*sm.0).unwrap_or(*sm.1);
+                chat_allowed_at = std::cmp::max(chat_allowed_at, ready_at);
+            }
+
+            // 单 chat 每秒窗口。
+            if limits.messages_per_sec_chat > 0 {
+                let mut remove_sec = false;
+                let mut sec_ready_at: Option<Instant> = None;
+                if let Some(deq) = per_chat_sec.get_mut(chat) {
+                    trim_deque(deq, sec_back);
+                    if deq.len() as u32 >= limits.messages_per_sec_chat {
+                        if let Some(t0) = deq.front().copied() {
+                            sec_ready_at = Some(t0.checked_add(SECOND).unwrap_or(t0));
+                        }
+                    }
+                    remove_sec = deq.is_empty();
+                }
+                if remove_sec {
+                    per_chat_sec.remove(chat);
+                }
+                if let Some(t) = sec_ready_at {
+                    chat_allowed_at = std::cmp::max(chat_allowed_at, t);
                 }
             }
 
-            let requests_sent_per_sec_count = requests_sent.per_sec.get(chat).copied().unwrap_or(0);
-            let requests_sent_per_min_count = requests_sent.per_min.get(chat).copied().unwrap_or(0);
-
-            let messages_per_min_limit = if chat.is_channel_or_supergroup() {
+            // 单 chat 每分钟窗口（普通 chat / 超群/频道不同上限）。
+            let per_min_limit = if chat.is_channel_or_supergroup() {
                 limits.messages_per_min_channel_or_supergroup
             } else {
                 limits.messages_per_min_chat
             };
+            if per_min_limit > 0 {
+                let mut remove_min = false;
+                let mut min_ready_at: Option<Instant> = None;
+                if let Some(deq) = per_chat_min.get_mut(chat) {
+                    trim_deque(deq, min_back);
+                    if deq.len() as u32 >= per_min_limit {
+                        if let Some(t0) = deq.front().copied() {
+                            min_ready_at = Some(t0.checked_add(MINUTE).unwrap_or(t0));
+                        }
+                    }
+                    remove_min = deq.is_empty();
+                }
+                if remove_min {
+                    per_chat_min.remove(chat);
+                }
+                if let Some(t) = min_ready_at {
+                    chat_allowed_at = std::cmp::max(chat_allowed_at, t);
+                }
+            }
 
-            let limits_not_exceeded = requests_sent_per_sec_count < limits.messages_per_sec_chat
-                && requests_sent_per_min_count < messages_per_min_limit;
-
-            if limits_not_exceeded {
-                // Unlock the associated request.
-
+            if chat_allowed_at <= now {
                 let chat = *chat;
                 let (_, lock) = entry.remove();
-
                 // Only count request as sent if the request wasn't dropped before unlocked
                 if lock.unlock(retry, freeze_tx.clone()).is_ok() {
-                    *requests_sent.per_sec.entry(chat).or_insert(0) += 1;
-                    *requests_sent.per_min.entry(chat).or_insert(0) += 1;
-                    history.push_back((chat, Instant::now()));
+                    let sent_at = Instant::now();
 
-                    if let Some((_, last)) = slow_mode {
-                        *last = Instant::now();
+                    // 更新滑动窗口记录。
+                    global_sec.push_back(sent_at);
+                    per_chat_sec.entry(chat).or_default().push_back(sent_at);
+                    per_chat_min.entry(chat).or_default().push_back(sent_at);
+
+                    if let Some(sm) = slow_mode.as_mut().and_then(|m| m.get_mut(&chat)) {
+                        sm.1 = sent_at;
                     }
 
-                    // We have "sent" one request, so now we can send one less.
-                    allowed -= 1;
-                    if allowed == 0 {
+                    allowed_global -= 1;
+
+                    // 保护：全局每秒窗口可能触顶，提前结束本轮扫描。
+                    if global_sec.len() as u32 >= limits.messages_per_sec_overall {
                         break;
+                    }
+                }
+            } else if chat_allowed_at > now {
+                next_wake_at = min_instant_opt(next_wake_at, chat_allowed_at);
+            }
+        }
+
+        // 队列还有积压：计算下一次唤醒时间（最早可放行的那个）。
+        if !queue.is_empty() {
+            // 全局每秒触顶时，优先等待全局窗口释放。
+            if global_sec.len() as u32 >= limits.messages_per_sec_overall {
+                let next_at = global_sec
+                    .front()
+                    .copied()
+                    .and_then(|t| t.checked_add(SECOND))
+                    .unwrap_or(now);
+                next_wake_at = Some(next_at);
+            }
+
+            if let Some(next_at) = next_wake_at {
+                if next_at > Instant::now() {
+                    let sleep = tokio::time::sleep_until(next_at.into());
+                    tokio::pin!(sleep);
+                    tokio::select! {
+                        _ = &mut sleep => {}
+                        Some(freeze_until) = freeze_rx.recv() => {
+                            freeze(&mut freeze_rx, slow_mode.as_mut(), &bot, Some(freeze_until)).await;
+                        }
+                        Some(info) = info_rx.recv() => {
+                            handle_info_message(info, &mut limits);
+                        }
+                        req = rx.recv(), if queue.len() < queue.capacity() && !rx_is_closed => {
+                            match req {
+                                Some(r) => queue.push(r),
+                                None => rx_is_closed = true,
+                            }
+                        }
                     }
                 }
             }
         }
-
-        // It's easier to just recompute last second stats, instead of keeping
-        // track of it alongside with minute stats, so we just throw this away.
-        requests_sent.per_sec.clear();
-        tokio::time::sleep(DELAY).await;
     }
 }
 
 fn answer_info(rx: &mut mpsc::Receiver<InfoMessage>, limits: &mut Limits) {
     while let Ok(req) = rx.try_recv() {
-        // Errors are ignored with .ok(). Error means that the response channel
-        // is closed and the response isn't needed.
-        match req {
-            InfoMessage::GetLimits { response } => response.send(*limits).ok(),
-            InfoMessage::SetLimits { new, response } => {
-                *limits = new;
-                response.send(()).ok()
-            }
-        };
+        handle_info_message(req, limits);
     }
 }
 
@@ -376,13 +483,6 @@ async fn read_from_rx<T>(rx: &mut mpsc::Receiver<T>, queue: &mut Vec<T>, rx_is_c
             // There are no items in queue.
             Err(TryRecvError::Empty) => break,
         }
-    }
-}
-
-fn either<L, R>(x: future::Either<L, R>) -> Either<L, R> {
-    match x {
-        future::Either::Left(l) => Either::Left(l),
-        future::Either::Right(r) => Either::Right(r),
     }
 }
 
